@@ -1,0 +1,128 @@
+name: 과제 자동 채점 및 알림 (Auto Grading & Slack Notification)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: '채점할 PR 번호'
+        required: true
+        default: '1'
+
+permissions:
+  pull-requests: write
+  contents: read
+  issues: write
+
+jobs:
+  grade-and-notify:
+    # pull_request_target일 때는 base가 main인 경우만 실행 (workflow_dispatch는 항상 실행)
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 저장소 체크아웃 (스크립트 로드용)
+        uses: actions/checkout@v4
+
+      - name: GitHub CLI 인증 설정
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
+
+      - name: PR 정보 및 변경사항(diff) 수집
+        id: pr_data
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR_NUMBER="${{ inputs.pr_number }}"
+            PR_JSON=$(gh pr view "$PR_NUMBER" --json number,title,author,url)
+            PR_TITLE=$(echo "$PR_JSON" | jq -r .title)
+            PR_AUTHOR=$(echo "$PR_JSON" | jq -r .author.login)
+            PR_URL=$(echo "$PR_JSON" | jq -r .url)
+          else
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            PR_TITLE="${{ github.event.pull_request.title }}"
+            PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+            PR_URL="${{ github.event.pull_request.html_url }}"
+          fi
+          
+          # PR 본문 추출
+          gh pr view "$PR_NUMBER" --json body -q .body > pr_body.txt
+          
+          # 변경 파일 목록 추출
+          gh pr diff "$PR_NUMBER" --name-only > pr_files.txt
+          
+          # 핵심 diff 추출 (최대 300줄)
+          gh pr diff "$PR_NUMBER" | head -n 300 > pr_diff.txt
+
+          # 환경변수 저장
+          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
+          echo "PR_TITLE=$PR_TITLE" >> $GITHUB_ENV
+          echo "PR_AUTHOR=$PR_AUTHOR" >> $GITHUB_ENV
+          echo "PR_URL=$PR_URL" >> $GITHUB_ENV
+
+      - name: Gemini API 자동 채점 및 피드백 생성
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PR_AUTHOR: ${{ env.PR_AUTHOR }}
+        run: node .github/scripts/grade.cjs
+
+      - name: PR 상태 및 라벨 자동 처리
+        run: |
+          PR_NUMBER="${{ env.PR_NUMBER }}"
+          
+          # 라벨 사전 생성 (없을 경우 에러 방지)
+          gh label create "통과" --color "0e8a16" --description "과제 채점 통과" 2>/dev/null || true
+          gh label create "보완 필요" --color "d93f0b" --description "과제 보완 후 재제출 필요" 2>/dev/null || true
+
+          # 1. 평가 코멘트 등록
+          gh pr comment "$PR_NUMBER" --body-file result_comment.txt
+          
+          # 2. 판정 결과에 따른 라벨 부착 및 Close/Open 분기
+          STATUS=$(cat status.txt 2>/dev/null || echo "RETRY")
+          
+          if [ "$STATUS" = "PASS" ]; then
+            echo "판정 결과: 통과 (PASS) -> '통과' 라벨 부착 및 PR 자동 Close"
+            gh pr edit "$PR_NUMBER" --remove-label "보완 필요" 2>/dev/null || true
+            gh pr edit "$PR_NUMBER" --add-label "통과"
+            gh pr close "$PR_NUMBER" --comment "🎉 과제 제출 및 자동 채점 검토가 완료되어 PR을 자동으로 Close합니다. 수고 많으셨습니다!"
+          else
+            echo "판정 결과: 보완 필요 (RETRY) -> '보완 필요' 라벨 부착 및 PR Open 유지"
+            gh pr edit "$PR_NUMBER" --remove-label "통과" 2>/dev/null || true
+            gh pr edit "$PR_NUMBER" --add-label "보완 필요"
+            gh pr comment "$PR_NUMBER" --body "📢 보완이 필요한 항목이 확인되어 PR을 Open 상태로 유지합니다. 위의 채점 리포트를 확인하신 후 수정하여 다시 push해 주세요!"
+          fi
+
+      - name: Slack 채널 알림 발송
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PR_URL: ${{ env.PR_URL }}
+          PR_AUTHOR: ${{ env.PR_AUTHOR }}
+          PR_TITLE: ${{ env.PR_TITLE }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL이 설정되어 있지 않아 알림을 건너뜁니다."
+            exit 0
+          fi
+          
+          SUMMARY=$(cat summary.txt 2>/dev/null || echo "평가 완료")
+          STATUS=$(cat status.txt 2>/dev/null || echo "RETRY")
+          COLOR=$([ "$STATUS" = "PASS" ] && echo "#36a64f" || echo "#e01e5a")
+          ICON=$([ "$STATUS" = "PASS" ] && echo "✅" || echo "⚠️")
+
+          PAYLOAD=$(jq -nc \
+            --arg author "$PR_AUTHOR" \
+            --arg title "$PR_TITLE" \
+            --arg url "$PR_URL" \
+            --arg summary "$SUMMARY" \
+            --arg icon "$ICON" \
+            --arg color "$COLOR" \
+            '{
+              attachments: [{
+                color: $color,
+                title: "\($icon) [10주차 날씨 대시보드 과제 제출] \($author) (\($summary))",
+                title_link: $url,
+                text: "PR: <\($url)|\($title)>\n판정: \($summary)",
+                ts: (now | floor)
+              }]
+            }')
+
+          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
